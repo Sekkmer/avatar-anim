@@ -1,0 +1,15 @@
+[package]
+name = "avatar-anim"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1"
+authors = ["Sekkmer"]
+readme = "README.md"
+description = "A parser for Second Life avatar animations files"
+repository = "https://github.com/Sekkmer/avatar-anim"
+keywords = ["secondlife", "parser"]
+
+[dependencies]
+binrw = "0.15.0"
+glam = "0.30.4"
+llsd-rs = "0.1.3"
