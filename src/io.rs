@@ -3,6 +3,7 @@ use binrw::{
     io::{Read, Seek, Write},
 };
 use glam::{Quat, Vec3};
+use std::string::FromUtf8Error;
 
 const OOU16MAX: f32 = 1.0f32 / u16::MAX as f32;
 
@@ -45,7 +46,10 @@ pub fn read_null_terminated_string<R: Read + Seek>(
         }
         buf.push(byte[0]);
     }
-    Ok(String::from_utf8(buf).unwrap())
+    String::from_utf8(buf).map_err(|e: FromUtf8Error| binrw::Error::AssertFail {
+        pos: 0,
+        message: format!("Invalid UTF-8 in null-terminated string: {e}"),
+    })
 }
 
 pub fn write_null_terminated_string<W: Write + Seek>(
@@ -93,16 +97,19 @@ pub fn write_fixed_length_string<W: Write + Seek>(
 
 pub fn read_rot_quat<R: Read + Seek>(reader: &mut R, e: Endian, _: ()) -> BinResult<Quat> {
     use binrw::BinRead;
-    let x: f32 = u16_to_f32(u16::read_options(reader, e, ())?, -1.0f32, 1.0f32);
-    let y: f32 = u16_to_f32(u16::read_options(reader, e, ())?, -1.0f32, 1.0f32);
-    let z: f32 = u16_to_f32(u16::read_options(reader, e, ())?, -1.0f32, 1.0f32);
-
-    let w = 1.0f32 - (x * x - y * y - z * z);
-    if w > 0.0 {
-        Ok(Quat::from_xyzw(x, y, z, w.sqrt()))
-    } else {
-        Ok(Quat::from_xyzw(x, y, z, 0.0))
+    let x: f32 = u16_to_f32(u16::read_options(reader, e, ())?, -1.0, 1.0);
+    let y: f32 = u16_to_f32(u16::read_options(reader, e, ())?, -1.0, 1.0);
+    let z: f32 = u16_to_f32(u16::read_options(reader, e, ())?, -1.0, 1.0);
+    let sum = x * x + y * y + z * z;
+    let w = if sum <= 1.0 { (1.0 - sum).sqrt() } else { 0.0 };
+    let mut q = Quat::from_xyzw(x, y, z, w);
+    if q.length_squared() > 0.0 {
+        q = q.normalize();
     }
+    if q.w < 0.0 {
+        q = Quat::from_xyzw(-q.x, -q.y, -q.z, -q.w);
+    }
+    Ok(q)
 }
 
 pub fn write_rot_quat<W: Write + Seek>(
@@ -112,24 +119,18 @@ pub fn write_rot_quat<W: Write + Seek>(
     _: (),
 ) -> BinResult<()> {
     use binrw::BinWrite;
-    let mut x = value.x;
-    let mut y = value.y;
-    let mut z = value.z;
-    let w = value.w;
-    let mag = (x * x + y * y + z * z + w * w).sqrt();
-    if mag > 0.0000001f32 {
-        x /= mag;
-        y /= mag;
-        z /= mag;
+    let mut q = if value.length_squared() > 0.0 {
+        value.normalize()
+    } else {
+        *value
+    };
+    // Enforce canonical hemisphere (positive w) for stable roundtrips
+    if q.w < 0.0 {
+        q = Quat::from_xyzw(-q.x, -q.y, -q.z, -q.w);
     }
-    if w < 0.0f32 {
-        x = -x;
-        y = -y;
-        z = -z;
-    }
-    f32_to_u16(x, -1.0f32, 1.0f32).write_options(writer, e, ())?;
-    f32_to_u16(y, -1.0f32, 1.0f32).write_options(writer, e, ())?;
-    f32_to_u16(z, -1.0f32, 1.0f32).write_options(writer, e, ())
+    f32_to_u16(q.x, -1.0, 1.0).write_options(writer, e, ())?;
+    f32_to_u16(q.y, -1.0, 1.0).write_options(writer, e, ())?;
+    f32_to_u16(q.z, -1.0, 1.0).write_options(writer, e, ())
 }
 
 pub fn read_pos_vec3<R: Read + Seek>(reader: &mut R, e: Endian, _: ()) -> BinResult<Vec3> {
@@ -150,4 +151,33 @@ pub fn write_pos_vec3<W: Write + Seek>(
     f32_to_u16(value.x, -5.0f32, 5.0f32).write_options(writer, e, ())?;
     f32_to_u16(value.y, -5.0f32, 5.0f32).write_options(writer, e, ())?;
     f32_to_u16(value.z, -5.0f32, 5.0f32).write_options(writer, e, ())
+}
+
+// Quantization helper docs:
+// Rotation components are stored as 3 * u16 for x,y,z with range [-1,1]; w is reconstructed.
+// Max component absolute quantization error ~= 1 / 65535 * 2 = 3.05e-5 before normalization.
+// Position components stored as u16 over [-5,5]; max absolute error ~= 10 / 65535 ≈ 1.53e-4.
+
+pub fn quantize_rotation(q: Quat) -> (u16, u16, u16) {
+    let mut qn = if q.length_squared() > 0.0 {
+        q.normalize()
+    } else {
+        q
+    };
+    if qn.w < 0.0 {
+        qn = Quat::from_xyzw(-qn.x, -qn.y, -qn.z, -qn.w);
+    }
+    (
+        f32_to_u16(qn.x, -1.0, 1.0),
+        f32_to_u16(qn.y, -1.0, 1.0),
+        f32_to_u16(qn.z, -1.0, 1.0),
+    )
+}
+
+pub fn quantize_position(v: Vec3) -> (u16, u16, u16) {
+    (
+        f32_to_u16(v.x, -5.0, 5.0),
+        f32_to_u16(v.y, -5.0, 5.0),
+        f32_to_u16(v.z, -5.0, 5.0),
+    )
 }

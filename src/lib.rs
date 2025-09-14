@@ -2,10 +2,26 @@ use binrw::binrw;
 use glam::{EulerRot, Quat, Vec3};
 use llsd_rs::Llsd;
 use std::collections::HashSet;
+use thiserror::Error;
 
-mod io;
+pub mod io;
 
 use crate::io::*;
+
+pub use AnimError as Error;
+pub type Result<T> = std::result::Result<T, AnimError>;
+
+#[derive(Debug, Error)]
+pub enum AnimError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Binary parsing error: {0}")]
+    BinRw(#[from] binrw::Error),
+    #[error("Invalid structure: {0}")]
+    InvalidStructure(String),
+    #[error("LLSD parse error: {0}")]
+    Llsd(String),
+}
 
 #[binrw]
 #[brw(little)]
@@ -144,6 +160,71 @@ pub struct Animation {
     pub constraints: Vec<Constraint>,
 }
 
+/// Strategy for handling duplicate keyframe times when cleaning up keys.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum DuplicateKeyStrategy {
+    /// Keep the first encountered key (time-stable).
+    KeepFirst,
+    /// Keep the last encountered key.
+    KeepLast,
+    /// Average all keys with the same timestamp (rotation via progressive slerp, position via arithmetic mean).
+    Average,
+}
+
+fn group_average_rot(keys: &[RotationKey]) -> Vec<RotationKey> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < keys.len() {
+        let t = keys[i].time;
+        let mut acc = glam::Quat::IDENTITY;
+        let mut count = 0f32;
+        let mut j = i;
+        while j < keys.len() && keys[j].time == t {
+            acc = if count == 0.0 {
+                keys[j].rot
+            } else {
+                acc.slerp(keys[j].rot, 1.0 / (count + 1.0))
+            };
+            count += 1.0;
+            j += 1;
+        }
+        out.push(RotationKey {
+            time: t,
+            rot: acc.normalize(),
+        });
+        i = j;
+    }
+    out
+}
+
+fn group_average_pos(keys: &[PositionKey]) -> Vec<PositionKey> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < keys.len() {
+        let t = keys[i].time;
+        let mut acc = glam::Vec3::ZERO;
+        let mut count = 0.0f32;
+        let mut j = i;
+        while j < keys.len() && keys[j].time == t {
+            acc += keys[j].pos;
+            count += 1.0;
+            j += 1;
+        }
+        out.push(PositionKey {
+            time: t,
+            pos: acc / count,
+        });
+        i = j;
+    }
+    out
+}
+
 impl Animation {
     pub fn new() -> Self {
         Self::default()
@@ -220,6 +301,41 @@ impl Animation {
         self
     }
 
+    /// Cleanup duplicate keyframe times with a customizable strategy.
+    pub fn cleanup_keys_with(&mut self, strategy: DuplicateKeyStrategy) -> &mut Self {
+        for joint in &mut self.joints {
+            match strategy {
+                DuplicateKeyStrategy::KeepFirst => {
+                    let mut seen = HashSet::new();
+                    joint.rotation_keys.retain(|k| seen.insert(k.time));
+                    seen.clear();
+                    joint.position_keys.retain(|k| seen.insert(k.time));
+                }
+                DuplicateKeyStrategy::KeepLast => {
+                    // Retain last: iterate reverse, keep first occurrence in reverse order.
+                    let mut seen = HashSet::new();
+                    joint.rotation_keys.reverse();
+                    joint.rotation_keys.retain(|k| seen.insert(k.time));
+                    joint.rotation_keys.reverse();
+                    seen.clear();
+                    joint.position_keys.reverse();
+                    joint.position_keys.retain(|k| seen.insert(k.time));
+                    joint.position_keys.reverse();
+                }
+                DuplicateKeyStrategy::Average => {
+                    // Group by time then average.
+                    joint.rotation_keys.sort_by_key(|k| k.time);
+                    joint.position_keys.sort_by_key(|k| k.time);
+                    joint.rotation_keys = group_average_rot(&joint.rotation_keys);
+                    joint.position_keys = group_average_pos(&joint.position_keys);
+                }
+            }
+            joint.rotation_keys.sort_by_key(|k| k.time);
+            joint.position_keys.sort_by_key(|k| k.time);
+        }
+        self
+    }
+
     pub fn joint(&self, name: &str) -> Option<&JointData> {
         self.joints.iter().find(|joint| joint.name == name)
     }
@@ -253,19 +369,19 @@ impl Animation {
     /// use std::io::BufReader;
     /// use avatar_anim::Animation;
     ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> avatar_anim::Result<()> {
     /// // Load LLSD-XML file from Firestorm poses directory
     /// let file = BufReader::new(File::open("my_pose.xml")?);
-    /// let llsd = llsd_rs::xml::from_reader(file)?;
+    /// let llsd = llsd_rs::xml::from_reader(file).map_err(|e| avatar_anim::AnimError::Llsd(e.to_string()))?;
     ///
     /// // Convert to animation, including only enabled joints
     /// let animation = Animation::from_llsd(&llsd, true)?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn from_llsd(llsd: &Llsd, check_enabled: bool) -> Result<Self, String> {
+    pub fn from_llsd(llsd: &Llsd, check_enabled: bool) -> Result<Self> {
         let Some(joints) = llsd.as_map() else {
-            return Err("LLDS must be a map".into());
+            return Err(AnimError::InvalidStructure("LLSD must be a map".into()));
         };
         let mut animation = Self::default();
         for (key, value) in joints {
@@ -313,19 +429,18 @@ impl Animation {
     /// ```rust,no_run
     /// use avatar_anim::Animation;
     ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> avatar_anim::Result<()> {
     /// let animation = Animation::from_file("my_animation.anim")?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, binrw::Error> {
+    pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         use binrw::BinRead;
         use std::fs::File;
         use std::io::BufReader;
-
-        let file = File::open(path)?;
+        let file = File::open(path).map_err(AnimError::Io)?;
         let mut reader = BufReader::new(file);
-        Self::read(&mut reader)
+        Self::read(&mut reader).map_err(AnimError::BinRw)
     }
 
     /// Save an animation to a .anim file
@@ -335,20 +450,19 @@ impl Animation {
     /// ```rust,no_run
     /// use avatar_anim::Animation;
     ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> avatar_anim::Result<()> {
     /// let animation = Animation::default();
     /// animation.to_file("output.anim")?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn to_file<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), binrw::Error> {
+    pub fn to_file<P: AsRef<std::path::Path>>(&self, path: P) -> Result<()> {
         use binrw::BinWrite;
         use std::fs::File;
         use std::io::BufWriter;
-
-        let file = File::create(path)?;
+        let file = File::create(path).map_err(AnimError::Io)?;
         let mut writer = BufWriter::new(file);
-        self.write(&mut writer)
+        self.write(&mut writer).map_err(AnimError::BinRw)
     }
 
     /// Load LLSD-XML data from a Firestorm pose file
@@ -363,16 +477,12 @@ impl Animation {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn from_llsd_file<P: AsRef<std::path::Path>>(
-        path: P,
-        check_enabled: bool,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_llsd_file<P: AsRef<std::path::Path>>(path: P, check_enabled: bool) -> Result<Self> {
         use std::fs::File;
         use std::io::BufReader;
-
-        let file = File::open(path)?;
+        let file = File::open(path).map_err(AnimError::Io)?;
         let reader = BufReader::new(file);
-        let llsd = llsd_rs::xml::from_reader(reader)?;
-        Ok(Self::from_llsd(&llsd, check_enabled)?)
+        let llsd = llsd_rs::xml::from_reader(reader).map_err(|e| AnimError::Llsd(e.to_string()))?;
+        Self::from_llsd(&llsd, check_enabled)
     }
 }
