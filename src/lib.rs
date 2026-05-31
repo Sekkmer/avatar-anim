@@ -1,14 +1,22 @@
-use binrw::binrw;
+use binrw::io::{Read, Seek, Write};
+use binrw::{BinRead, BinResult, BinWrite, Endian, binrw};
 use glam::{EulerRot, Quat, Vec3};
 use llsd_rs::Llsd;
 use std::collections::HashSet;
 use thiserror::Error;
 
 pub mod io;
+pub mod skeleton;
 
-use crate::io::*;
+use crate::io::{
+    AnimReadContext, AnimVersion, KEYFRAME_MOTION_SUBVERSION, KEYFRAME_MOTION_VERSION,
+    classify_anim_version, read_fixed_length_string, read_null_terminated_string, read_pos_vec3,
+    read_position_keys, read_rot_quat, read_rotation_keys, write_fixed_length_string,
+    write_null_terminated_string, write_pos_vec3, write_rot_quat,
+};
 
 pub use AnimError as Error;
+pub use skeleton::{SkeletonBone, SkeletonDefinition};
 pub type Result<T> = std::result::Result<T, AnimError>;
 
 #[derive(Debug, Error)]
@@ -92,26 +100,62 @@ impl From<Vec3> for PositionKey {
     }
 }
 
-#[binrw]
-#[brw(little)]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct JointData {
-    #[br(parse_with = read_null_terminated_string)]
-    #[bw(write_with = write_null_terminated_string)]
     pub name: String,
     pub priority: i32,
-
-    #[br(temp)]
-    #[bw(calc = rotation_keys.len() as i32)]
-    num_rot_keys: i32,
-    #[br(count = num_rot_keys)]
     pub rotation_keys: Vec<RotationKey>,
-
-    #[br(temp)]
-    #[bw(calc = position_keys.len() as i32)]
-    num_pos_keys: i32,
-    #[br(count = num_pos_keys)]
     pub position_keys: Vec<PositionKey>,
+}
+
+impl BinRead for JointData {
+    type Args<'a> = AnimReadContext;
+
+    fn read_options<R: Read + Seek>(
+        reader: &mut R,
+        endian: Endian,
+        ctx: Self::Args<'_>,
+    ) -> BinResult<Self> {
+        let name = read_null_terminated_string(reader, endian, ())?;
+        let priority = i32::read_options(reader, endian, ())?;
+
+        let num_rot_keys = i32::read_options(reader, endian, ())?;
+        let rotation_keys = read_rotation_keys(reader, endian, num_rot_keys, ctx)?;
+
+        let num_pos_keys = i32::read_options(reader, endian, ())?;
+        let position_keys = read_position_keys(reader, endian, num_pos_keys, ctx)?;
+
+        Ok(Self {
+            name,
+            priority,
+            rotation_keys,
+            position_keys,
+        })
+    }
+}
+
+impl BinWrite for JointData {
+    type Args<'a> = ();
+
+    fn write_options<W: Write + Seek>(
+        &self,
+        writer: &mut W,
+        endian: Endian,
+        _args: Self::Args<'_>,
+    ) -> BinResult<()> {
+        write_null_terminated_string(&self.name, writer, endian, ())?;
+        self.priority.write_options(writer, endian, ())?;
+        (self.rotation_keys.len() as i32).write_options(writer, endian, ())?;
+        for key in &self.rotation_keys {
+            key.write_options(writer, endian, ())?;
+        }
+
+        (self.position_keys.len() as i32).write_options(writer, endian, ())?;
+        for key in &self.position_keys {
+            key.write_options(writer, endian, ())?;
+        }
+        Ok(())
+    }
 }
 
 #[binrw]
@@ -121,16 +165,14 @@ pub struct Constraint {
     pub chain_length: u8,
     pub constraint_type: u8,
 
-    #[br(count = 16)]
-    #[br(parse_with = read_fixed_length_string)]
-    #[bw(write_with = write_fixed_length_string)]
+    #[br(parse_with = read_fixed_length_string, args(16usize))]
+    #[bw(write_with = write_fixed_length_string, args(16usize))]
     pub source_volume: String,
 
     pub source_offset: [f32; 3],
 
-    #[br(count = 16)]
-    #[br(parse_with = read_fixed_length_string)]
-    #[bw(write_with = write_fixed_length_string)]
+    #[br(parse_with = read_fixed_length_string, args(16usize))]
+    #[bw(write_with = write_fixed_length_string, args(16usize))]
     pub target_volume: String,
 
     pub target_offset: [f32; 3],
@@ -141,23 +183,84 @@ pub struct Constraint {
     pub ease_out_stop: f32,
 }
 
-#[binrw]
-#[brw(little)]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Animation {
     pub header: AnimationHeader,
-
-    #[br(temp)]
-    #[bw(calc = joints.len() as u32)]
-    num_joints: u32,
-    #[br(count = num_joints)]
     pub joints: Vec<JointData>,
-
-    #[br(temp)]
-    #[bw(calc = constraints.len() as i32)]
-    num_constraints: i32,
-    #[br(count = num_constraints)]
     pub constraints: Vec<Constraint>,
+}
+
+impl BinRead for Animation {
+    type Args<'a> = ();
+
+    fn read_options<R: Read + Seek>(
+        reader: &mut R,
+        endian: Endian,
+        _args: Self::Args<'_>,
+    ) -> BinResult<Self> {
+        let mut header = AnimationHeader::read_options(reader, endian, ())?;
+        let version = classify_anim_version(header.version, header.sub_version)?;
+        if version == AnimVersion::Old {
+            header.version = KEYFRAME_MOTION_VERSION;
+            header.sub_version = KEYFRAME_MOTION_SUBVERSION;
+        }
+        let ctx = AnimReadContext {
+            version,
+            duration: header.duration,
+        };
+
+        let num_joints = u32::read_options(reader, endian, ())?;
+        let mut joints = Vec::with_capacity(num_joints as usize);
+        for _ in 0..num_joints {
+            joints.push(JointData::read_options(reader, endian, ctx)?);
+        }
+
+        let num_constraints = i32::read_options(reader, endian, ())?;
+        if num_constraints < 0 {
+            return Err(binrw::Error::AssertFail {
+                pos: 0,
+                message: "num_constraints must be non-negative".into(),
+            });
+        }
+        let mut constraints = Vec::with_capacity(num_constraints as usize);
+        for _ in 0..num_constraints {
+            constraints.push(Constraint::read_options(reader, endian, ())?);
+        }
+
+        Ok(Self {
+            header,
+            joints,
+            constraints,
+        })
+    }
+}
+
+impl BinWrite for Animation {
+    type Args<'a> = ();
+
+    fn write_options<W: Write + Seek>(
+        &self,
+        writer: &mut W,
+        endian: Endian,
+        _args: Self::Args<'_>,
+    ) -> BinResult<()> {
+        let header = AnimationHeader {
+            version: KEYFRAME_MOTION_VERSION,
+            sub_version: KEYFRAME_MOTION_SUBVERSION,
+            ..self.header.clone()
+        };
+        header.write_options(writer, endian, ())?;
+        (self.joints.len() as u32).write_options(writer, endian, ())?;
+        for joint in &self.joints {
+            joint.write_options(writer, endian, ())?;
+        }
+
+        (self.constraints.len() as i32).write_options(writer, endian, ())?;
+        for constraint in &self.constraints {
+            constraint.write_options(writer, endian, ())?;
+        }
+        Ok(())
+    }
 }
 
 /// Strategy for handling duplicate keyframe times when cleaning up keys.
@@ -238,6 +341,14 @@ impl Animation {
         self
     }
 
+    pub fn set_duration(&mut self, duration: f32) -> &mut Self {
+        let duration = duration.max(0.0);
+        self.header.duration = duration;
+        self.header.loop_in_point = 0.0;
+        self.header.loop_out_point = duration;
+        self
+    }
+
     pub fn set_joint_priority(&mut self, priority: i32) -> &mut Self {
         for joint in &mut self.joints {
             joint.priority = priority;
@@ -263,6 +374,16 @@ impl Animation {
             if joints(joint) {
                 joint.position_keys.clear();
             }
+        }
+        self
+    }
+
+    pub fn drop_zero_position_keys(&mut self, epsilon: f32) -> &mut Self {
+        let epsilon_sq = epsilon.max(0.0) * epsilon.max(0.0);
+        for joint in &mut self.joints {
+            joint
+                .position_keys
+                .retain(|key| key.pos.length_squared() > epsilon_sq);
         }
         self
     }
@@ -342,6 +463,68 @@ impl Animation {
 
     pub fn joint_mut(&mut self, name: &str) -> Option<&mut JointData> {
         self.joints.iter_mut().find(|joint| joint.name == name)
+    }
+
+    pub fn position_reset_from_skeleton<'a>(
+        skeleton: &SkeletonDefinition,
+        joint_names: impl IntoIterator<Item = &'a str>,
+        priority: i32,
+    ) -> Result<Self> {
+        let mut bones = Vec::new();
+        for name in joint_names {
+            let bone = skeleton.bone(name).ok_or_else(|| {
+                AnimError::InvalidStructure(format!("Skeleton is missing required bone '{name}'"))
+            })?;
+            bones.push(bone);
+        }
+        Self::position_reset_from_bones(bones, priority)
+    }
+
+    pub fn position_reset_from_bones<'a>(
+        bones: impl IntoIterator<Item = &'a SkeletonBone>,
+        priority: i32,
+    ) -> Result<Self> {
+        let priority = priority.clamp(0, 7);
+        let mut animation = Self::default();
+        animation.header.base_priority = priority;
+
+        for bone in bones {
+            animation.joints.push(JointData {
+                name: bone.name.clone(),
+                priority,
+                rotation_keys: Vec::new(),
+                position_keys: vec![
+                    PositionKey {
+                        time: 0,
+                        pos: bone.pos,
+                    },
+                    PositionKey {
+                        time: u16::MAX,
+                        pos: bone.pos,
+                    },
+                ],
+            });
+        }
+
+        Ok(animation)
+    }
+
+    pub fn add_skeleton_positions(&mut self, skeleton: &SkeletonDefinition) -> Result<&mut Self> {
+        for joint in &mut self.joints {
+            if joint.position_keys.is_empty() {
+                continue;
+            }
+            let base_pos = skeleton.position(&joint.name).ok_or_else(|| {
+                AnimError::InvalidStructure(format!(
+                    "Skeleton is missing position for joint '{}'",
+                    joint.name
+                ))
+            })?;
+            for key in &mut joint.position_keys {
+                key.pos += base_pos;
+            }
+        }
+        Ok(self)
     }
 
     /// Creates an animation from LLSD data, typically from Firestorm poser files.
@@ -440,7 +623,7 @@ impl Animation {
         use std::io::BufReader;
         let file = File::open(path).map_err(AnimError::Io)?;
         let mut reader = BufReader::new(file);
-        Self::read(&mut reader).map_err(AnimError::BinRw)
+        Self::read_options(&mut reader, Endian::Little, ()).map_err(AnimError::BinRw)
     }
 
     /// Save an animation to a .anim file
@@ -462,7 +645,8 @@ impl Animation {
         use std::io::BufWriter;
         let file = File::create(path).map_err(AnimError::Io)?;
         let mut writer = BufWriter::new(file);
-        self.write(&mut writer).map_err(AnimError::BinRw)
+        self.write_options(&mut writer, Endian::Little, ())
+            .map_err(AnimError::BinRw)
     }
 
     /// Load LLSD-XML data from a Firestorm pose file

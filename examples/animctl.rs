@@ -1,9 +1,13 @@
-use avatar_anim::{Animation, DuplicateKeyStrategy, JointData, PositionKey, Result, RotationKey};
+use avatar_anim::{
+    Animation, DuplicateKeyStrategy, JointData, PositionKey, Result, RotationKey, SkeletonBone,
+    SkeletonDefinition,
+};
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::{
     generate,
     shells::{Bash, Elvish, Fish, PowerShell, Zsh},
 };
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::PathBuf;
@@ -16,8 +20,12 @@ use std::path::PathBuf;
 ///   animctl clean last input.anim -o cleaned.anim
 ///   animctl strip rotation input.anim stripped.anim
 ///   animctl convert -i pose.xml -o pose.anim -p 6 --drop Pelvis,Head
+///   animctl convert -i pose.xml -o pose.anim --duration 2.0
+///   animctl convert -i pose.xml -o pose.anim --drop-zero-positions --add-skeleton-positions avatar_skeleton.xml
 ///   animctl convert -i pose.xml --insert Spine:rot<0.1,0.2,0.0>@120 --insert Pelvis:pos<0,0,0.05>
 ///   animctl convert -i base.anim --drop-rotations --insert Head:rot@42 -o - > head_only.anim
+///   animctl skeleton-bones --skeleton avatar_skeleton.xml --prefix mTail
+///   animctl position-reset --skeleton avatar_skeleton.xml --prefix mTail -o reset.anim
 ///
 /// Use --verbose on convert for detailed stats and full structure dump to stderr.
 #[derive(Parser, Debug)]
@@ -74,9 +82,15 @@ enum Commands {
         /// Set priority (0..=7) across animation and joints.
         #[arg(short = 'p', long = "priority")]
         priority: Option<i32>,
+        /// Set animation duration in seconds and align loop-out to the same value
+        #[arg(long = "duration")]
+        duration: Option<f32>,
         /// Drop all position keys (after inserts)
         #[arg(long = "drop-positions")]
         drop_positions: bool,
+        /// Drop position keys whose delta is exactly zero before adding skeleton positions
+        #[arg(long = "drop-zero-positions")]
+        drop_zero_positions: bool,
         /// Drop all rotation keys (after inserts)
         #[arg(long = "drop-rotations")]
         drop_rotations: bool,
@@ -89,6 +103,10 @@ enum Commands {
         /// Drop entire joints (comma separated list)
         #[arg(long = "drop")]
         drop_joints: Option<String>,
+        /// Add SL skeleton local bone positions to all position keys.
+        /// Use this when converting poser XML positions stored as deltas from avatar_skeleton.xml.
+        #[arg(long = "add-skeleton-positions", value_hint=ValueHint::FilePath)]
+        add_skeleton_positions: Option<PathBuf>,
         /// Verbose: detailed stats + full structure debug to stderr (stdout kept clean for binary output)
         #[arg(short = 'v', long = "verbose")]
         verbose: bool,
@@ -125,6 +143,49 @@ Examples:
         /// Also include a summary count line for each joint when listing all
         #[arg(long = "summary")]
         summary: bool,
+    },
+    /// List bones loaded from SL avatar_skeleton.xml
+    SkeletonBones {
+        /// SL avatar_skeleton.xml to inspect
+        #[arg(short = 's', long = "skeleton", value_hint=ValueHint::FilePath)]
+        skeleton: PathBuf,
+        /// Include exact bone names (repeatable or comma separated)
+        #[arg(long = "joint", value_delimiter = ',')]
+        joints: Vec<String>,
+        /// Include bone names with this prefix (repeatable or comma separated)
+        #[arg(long = "prefix", value_delimiter = ',')]
+        prefixes: Vec<String>,
+        /// Include bones in this skeleton group (repeatable or comma separated)
+        #[arg(long = "group", value_delimiter = ',')]
+        groups: Vec<String>,
+        /// List every bone with a position
+        #[arg(long = "all")]
+        all: bool,
+    },
+    /// Create a position-only reset animation from selected SL skeleton bones
+    #[command(alias = "tail-reset")]
+    PositionReset {
+        /// SL avatar_skeleton.xml to read default local positions from
+        #[arg(short = 's', long = "skeleton", value_hint=ValueHint::FilePath)]
+        skeleton: PathBuf,
+        /// Output .anim path
+        #[arg(short = 'o', long = "output", default_value = "reset.anim", value_hint=ValueHint::FilePath)]
+        output: PathBuf,
+        /// Animation and joint priority
+        #[arg(short = 'p', long = "priority", default_value_t = 6)]
+        priority: i32,
+        /// Include exact bone names (repeatable or comma separated)
+        #[arg(long = "joint", value_delimiter = ',')]
+        joints: Vec<String>,
+        /// Include bone names with this prefix (repeatable or comma separated)
+        #[arg(long = "prefix", value_delimiter = ',')]
+        prefixes: Vec<String>,
+        /// Include bones in this skeleton group (repeatable or comma separated)
+        #[arg(long = "group", value_delimiter = ',')]
+        groups: Vec<String>,
+        /// Include every bone with a position
+        #[arg(long = "all")]
+        all: bool,
     },
     /// Generate shell completion script to stdout
     Complete {
@@ -186,11 +247,14 @@ fn main() -> Result<()> {
             input,
             output,
             priority,
+            duration,
             drop_positions,
+            drop_zero_positions,
             drop_rotations,
             drop_position_named,
             drop_rotation_named,
             drop_joints,
+            add_skeleton_positions,
             verbose,
             insert,
         } => {
@@ -198,11 +262,14 @@ fn main() -> Result<()> {
                 input,
                 output,
                 priority,
+                duration,
                 drop_positions,
+                drop_zero_positions,
                 drop_rotations,
                 drop_position_named,
                 drop_rotation_named,
                 drop_joints,
+                add_skeleton_positions,
                 verbose,
                 insert,
             )?;
@@ -212,6 +279,22 @@ fn main() -> Result<()> {
             joint,
             summary,
         } => cmd_joints(file, joint, summary)?,
+        Commands::SkeletonBones {
+            skeleton,
+            joints,
+            prefixes,
+            groups,
+            all,
+        } => cmd_skeleton_bones(skeleton, joints, prefixes, groups, all)?,
+        Commands::PositionReset {
+            skeleton,
+            output,
+            priority,
+            joints,
+            prefixes,
+            groups,
+            all,
+        } => cmd_position_reset(skeleton, output, priority, joints, prefixes, groups, all)?,
         Commands::Complete { shell } => cmd_complete(shell)?,
     }
     Ok(())
@@ -339,11 +422,14 @@ fn cmd_convert(
     input: PathBuf,
     output: Option<PathBuf>,
     priority: Option<i32>,
+    duration: Option<f32>,
     drop_positions: bool,
+    drop_zero_positions: bool,
     drop_rotations: bool,
     drop_position_named: Option<String>,
     drop_rotation_named: Option<String>,
     drop_joints: Option<String>,
+    add_skeleton_positions: Option<PathBuf>,
     verbose: bool,
     inserts: Vec<String>,
 ) -> Result<()> {
@@ -388,12 +474,23 @@ fn cmd_convert(
     if drop_positions {
         anim.drop_position_keys();
     }
+    if drop_zero_positions {
+        anim.drop_zero_position_keys(1e-6).drop_empty_joints();
+    }
     if drop_rotations {
         anim.drop_rotation_keys();
     }
 
+    if let Some(skeleton_path) = add_skeleton_positions {
+        let skeleton = SkeletonDefinition::from_xml_file(skeleton_path)?;
+        anim.add_skeleton_positions(&skeleton)?;
+    }
+
     if let Some(p) = priority {
         anim.set_priority(p.clamp(0, 7));
+    }
+    if let Some(duration) = duration {
+        anim.set_duration(duration);
     }
 
     // Clean duplicates with KeepLast as a sensible default when transforming
@@ -418,23 +515,24 @@ fn cmd_convert(
     }
 
     if let Some(out) = output {
-        anim.to_file(&out)?;
-        // If writing to stdout requested (e.g., '-') treat specially
         if out.as_os_str() == "-" {
             // Write raw .anim binary to stdout
             let mut buf: Vec<u8> = Vec::new();
             {
-                use binrw::BinWrite;
+                use binrw::{BinWrite, Endian};
                 let mut cursor = std::io::Cursor::new(&mut buf);
-                anim.write(&mut cursor)
+                anim.write_options(&mut cursor, Endian::Little, ())
                     .map_err(avatar_anim::AnimError::BinRw)?;
             }
             let stdout = io::stdout();
             let mut handle = stdout.lock();
             handle.write_all(&buf).map_err(avatar_anim::AnimError::Io)?;
-        } else if !verbose {
-            let mut stderr = io::stderr();
-            writeln!(stderr, "Wrote animation to {}", out.display()).ok();
+        } else {
+            anim.to_file(&out)?;
+            if !verbose {
+                let mut stderr = io::stderr();
+                writeln!(stderr, "Wrote animation to {}", out.display()).ok();
+            }
         }
     } else if !verbose {
         let mut stderr = io::stderr();
@@ -563,6 +661,100 @@ fn cmd_joints(file: PathBuf, joint: Option<String>, summary: bool) -> Result<()>
         }
     }
     Ok(())
+}
+
+fn cmd_skeleton_bones(
+    skeleton: PathBuf,
+    joints: Vec<String>,
+    prefixes: Vec<String>,
+    groups: Vec<String>,
+    all: bool,
+) -> Result<()> {
+    let skeleton = SkeletonDefinition::from_xml_file(&skeleton)?;
+    let bones = select_skeleton_bones(&skeleton, &joints, &prefixes, &groups, all)?;
+    for bone in bones {
+        let group = bone
+            .attributes
+            .get("group")
+            .map_or("", std::string::String::as_str);
+        let parent = bone.parent.as_deref().unwrap_or("");
+        println!(
+            "{} pos={:.3},{:.3},{:.3} parent={} group={}",
+            bone.name, bone.pos.x, bone.pos.y, bone.pos.z, parent, group
+        );
+    }
+    Ok(())
+}
+
+fn cmd_position_reset(
+    skeleton: PathBuf,
+    output: PathBuf,
+    priority: i32,
+    joints: Vec<String>,
+    prefixes: Vec<String>,
+    groups: Vec<String>,
+    all: bool,
+) -> Result<()> {
+    let skeleton = SkeletonDefinition::from_xml_file(&skeleton)?;
+    let bones = select_skeleton_bones(&skeleton, &joints, &prefixes, &groups, all)?;
+    let anim = Animation::position_reset_from_bones(bones.iter().copied(), priority)?;
+    anim.to_file(&output)?;
+
+    let mut stderr = io::stderr();
+    writeln!(
+        stderr,
+        "Wrote position-only reset animation to {}",
+        output.display(),
+    )
+    .ok();
+    Ok(())
+}
+
+fn select_skeleton_bones<'a>(
+    skeleton: &'a SkeletonDefinition,
+    joints: &[String],
+    prefixes: &[String],
+    groups: &[String],
+    all: bool,
+) -> Result<Vec<&'a SkeletonBone>> {
+    if !all && joints.is_empty() && prefixes.is_empty() && groups.is_empty() {
+        return Err(avatar_anim::AnimError::InvalidStructure(
+            "Select bones with --joint, --prefix, --group, or --all".into(),
+        ));
+    }
+
+    let joint_names: HashSet<&str> = joints.iter().map(|name| name.as_str()).collect();
+    for joint in joints {
+        if skeleton.bone(joint).is_none() {
+            return Err(avatar_anim::AnimError::InvalidStructure(format!(
+                "Skeleton is missing requested bone '{joint}'"
+            )));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut selected = Vec::new();
+    for bone in &skeleton.bones {
+        let group_match = bone
+            .attributes
+            .get("group")
+            .is_some_and(|group| groups.iter().any(|wanted| wanted == group));
+        let prefix_match = prefixes
+            .iter()
+            .any(|prefix| bone.name.starts_with(prefix.as_str()));
+        let joint_match = joint_names.contains(bone.name.as_str());
+        if (all || group_match || prefix_match || joint_match) && seen.insert(bone.name.as_str()) {
+            selected.push(bone);
+        }
+    }
+
+    if selected.is_empty() {
+        return Err(avatar_anim::AnimError::InvalidStructure(
+            "No skeleton bones matched the selection".into(),
+        ));
+    }
+
+    Ok(selected)
 }
 
 fn cmd_complete(shell: ShellKind) -> Result<()> {
