@@ -77,6 +77,7 @@ impl EditorDocument {
             let mut animation = Animation::from_llsd_xml(bytes, true)
                 .map_err(|error| format!("Could not read Firestorm pose: {error}"))?;
             animation.drop_empty_joints();
+            animation.set_priority(4);
             let selected_joint = animation.joints.first().map(|joint| joint.name.clone());
             Ok(Self {
                 name,
@@ -152,7 +153,7 @@ impl EditorDocument {
 
     pub fn export(&self, skeleton: &SkeletonDefinition) -> Result<Vec<u8>, String> {
         let mut animation = self.animation.clone();
-        animation.set_priority(self.priority.clamp(0, 7));
+        animation.header.base_priority = self.priority.clamp(0, 7);
         match self.position_policy {
             PositionPolicy::None => {
                 animation.drop_position_keys();
@@ -201,6 +202,25 @@ impl EditorDocument {
 
     pub fn remove_joint(&mut self, name: &str) {
         self.animation.joints.retain(|joint| joint.name != name);
+    }
+
+    pub fn set_global_priority(&mut self, priority: i32) {
+        let priority = priority.clamp(0, 7);
+        self.priority = priority;
+        self.animation.set_priority(priority);
+    }
+
+    pub fn joint_priority(&self, name: &str) -> i32 {
+        self.animation
+            .joint(name)
+            .map_or(self.priority, |joint| joint.priority)
+            .clamp(0, 7)
+    }
+
+    pub fn set_joint_priority(&mut self, name: &str, priority: i32) {
+        if let Some(joint) = self.animation.joint_mut(name) {
+            joint.priority = priority.clamp(0, 7);
+        }
     }
 
     pub fn toggle_channel(&mut self, name: &str, channel: Channel, enabled: bool) {
@@ -535,5 +555,34 @@ mod tests {
         assert_eq!(document.position_policy, PositionPolicy::All);
         assert!(document.animation.header.looped != 0);
         assert!((document.rotation_degrees("mTail1").y - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn export_preserves_per_joint_priority_overrides() {
+        let skeleton = SkeletonDefinition::embedded_avatar().unwrap();
+        let mut document = EditorDocument::blank();
+        document.toggle_channel("mHead", Channel::Rotation, true);
+        document.toggle_channel("mTail1", Channel::Rotation, true);
+        document.set_joint_priority("mHead", 2);
+        document.set_joint_priority("mTail1", 6);
+
+        let animation = Animation::from_bytes(&document.export(&skeleton).unwrap()).unwrap();
+
+        assert_eq!(animation.header.base_priority, 4);
+        assert_eq!(animation.joint("mHead").unwrap().priority, 2);
+        assert_eq!(animation.joint("mTail1").unwrap().priority, 6);
+    }
+
+    #[test]
+    fn global_priority_intentionally_updates_all_active_joints() {
+        let mut document = EditorDocument::blank();
+        document.toggle_channel("mHead", Channel::Rotation, true);
+        document.toggle_channel("mTail1", Channel::Position, true);
+
+        document.set_global_priority(7);
+
+        assert_eq!(document.priority, 7);
+        assert_eq!(document.joint_priority("mHead"), 7);
+        assert_eq!(document.joint_priority("mTail1"), 7);
     }
 }

@@ -933,6 +933,28 @@ select {
   gap: 8px;
 }
 
+.tool-toggle {
+  min-height: 37px;
+  cursor: pointer;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  background: var(--bg);
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.tool-toggle:hover,
+.tool-toggle.active {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+.tool-toggle.active {
+  box-shadow: inset 0 -2px var(--accent);
+}
+
 .rig-visibility {
   position: relative;
 }
@@ -1252,6 +1274,34 @@ svg.orbit .orbit-hit-area:active {
 .inspector-heading small {
   color: var(--muted);
   font-size: 0.67rem;
+}
+
+.joint-priority {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  padding: 11px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-2);
+  gap: 12px;
+}
+
+.joint-priority strong,
+.joint-priority small {
+  display: block;
+}
+
+.joint-priority strong {
+  font-size: 0.76rem;
+}
+
+.joint-priority small {
+  margin-top: 3px;
+  color: var(--dim);
+  font-size: 0.58rem;
+  line-height: 1.4;
 }
 
 .icon-button {

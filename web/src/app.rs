@@ -303,6 +303,13 @@ fn Header(
                 </div>
             </div>
             <div class="topbar-actions">
+                <a
+                    class="button secondary github-link"
+                    href="https://github.com/Sekkmer/avatar-anim"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title="View Avatar Anim on GitHub"
+                >"GitHub ↗"</a>
                 <label class="button secondary" for="global-file-input">"Open file"</label>
                 <button
                     class="button primary"
@@ -408,6 +415,7 @@ fn Editor(
     let active_only = RwSignal::new(true);
     let projection = RwSignal::new(Projection::Front);
     let hidden_groups = RwSignal::new(BTreeSet::<String>::new());
+    let show_gizmo = RwSignal::new(true);
 
     view! {
         <main class="editor-page">
@@ -448,6 +456,7 @@ fn Editor(
                         skeleton=Arc::clone(&skeleton)
                         projection
                         hidden_groups
+                        show_gizmo
                     />
                     <Show when=move || document.get().is_some_and(|doc| doc.mode == EditorMode::Animation)>
                         <Timeline document />
@@ -539,12 +548,15 @@ fn ExportSettings(
     view! {
         <div class="quick-export">
             <label>
-                <span>"Priority"</span>
+                <span>"Global priority"</span>
                 <select
+                    title="Apply this priority to every active joint"
                     prop:value=move || document.get().map(|doc| doc.priority.to_string()).unwrap_or_else(|| "4".to_owned())
                     on:change=move |event| {
                         let value = event_target_value(&event).parse::<i32>().unwrap_or(4);
-                        document.update(|state| if let Some(doc) = state { doc.priority = value; });
+                        document.update(|state| if let Some(doc) = state {
+                            doc.set_global_priority(value);
+                        });
                     }
                 >
                     {(0..=7).map(|priority| view! { <option value=priority>{priority}</option> }).collect_view()}
@@ -787,6 +799,7 @@ fn SkeletonStage(
     skeleton: Arc<SkeletonDefinition>,
     projection: RwSignal<Projection>,
     hidden_groups: RwSignal<BTreeSet<String>>,
+    show_gizmo: RwSignal<bool>,
 ) -> impl IntoView {
     let orbit_yaw = RwSignal::new(0.55_f32);
     let orbit_pitch = RwSignal::new(-0.12_f32);
@@ -802,6 +815,15 @@ fn SkeletonStage(
                 </div>
                 <div class="stage-controls">
                     <RigVisibility hidden_groups />
+                    <button
+                        class="tool-toggle"
+                        class:active=move || show_gizmo.get()
+                        type="button"
+                        aria-label="Show rotation gizmo"
+                        aria-pressed=move || show_gizmo.get().to_string()
+                        title="Show or hide the rotation gizmo"
+                        on:click=move |_| show_gizmo.update(|visible| *visible = !*visible)
+                    >"Gizmo"</button>
                     <div class="segmented" role="group" aria-label="Preview angle">
                         <button
                             class:active=move || projection.get() == Projection::Front
@@ -887,11 +909,15 @@ fn SkeletonStage(
                             </g>
                         }
                     }).collect_view();
-                    let gizmo = selected_point.and_then(|(x, y)| {
-                        let name = doc.selected_joint.clone()?;
-                        let rotation = doc.rotation_degrees(&name);
-                        Some(rotation_gizmo(x, y, name, rotation, gizmo_drag))
-                    });
+                    let gizmo = if show_gizmo.get() {
+                        selected_point.and_then(|(x, y)| {
+                            let name = doc.selected_joint.clone()?;
+                            let rotation = doc.rotation_degrees(&name);
+                            Some(rotation_gizmo(x, y, name, rotation, gizmo_drag))
+                        })
+                    } else {
+                        None
+                    };
                     view! {
                         <svg
                             class:orbit=move || projection.get() == Projection::Orbit
@@ -951,7 +977,11 @@ fn SkeletonStage(
                 }}
                 <div class="canvas-legend">
                     <Show when=move || projection.get() == Projection::Orbit>
-                        <span class="orbit-help">"Drag background to orbit · drag a gizmo ring to rotate"</span>
+                        <span class="orbit-help">{move || if show_gizmo.get() {
+                            "Drag background to orbit · drag a gizmo ring to rotate"
+                        } else {
+                            "Drag background to orbit"
+                        }}</span>
                     </Show>
                     <span><i class="active"></i>"Animated"</span>
                     <span><i></i>"Reference"</span>
@@ -1112,9 +1142,11 @@ fn Inspector(document: DocumentSignal, skeleton: Arc<SkeletonDefinition>) -> imp
                 let is_active = rotation_enabled || position_enabled;
                 let rotation = doc.rotation_degrees(&name);
                 let position = doc.position(&name);
+                let joint_priority = doc.joint_priority(&name);
 
                 let rotation_name = name.clone();
                 let position_name = name.clone();
+                let priority_name = name.clone();
                 let remove_button = if is_active {
                     let remove_name = name.clone();
                     view! {
@@ -1155,6 +1187,26 @@ fn Inspector(document: DocumentSignal, skeleton: Arc<SkeletonDefinition>) -> imp
                         <div><span class="eyebrow">{group.to_ascii_uppercase()}</span><h2>{name.clone()}</h2><small>{format!("Child of {parent}")}</small></div>
                         {remove_button}
                     </div>
+
+                    <label class="joint-priority">
+                        <span>
+                            <strong>"Joint priority"</strong>
+                            <small>"Shared by this joint's rotation and position keys"</small>
+                        </span>
+                        <select
+                            disabled=!is_active
+                            prop:value=joint_priority.to_string()
+                            title=if is_active { "Override priority for this joint" } else { "Add a channel before setting joint priority" }
+                            on:change=move |event| {
+                                let value = event_target_value(&event).parse::<i32>().unwrap_or(4);
+                                document.update(|state| if let Some(doc) = state {
+                                    doc.set_joint_priority(&priority_name, value);
+                                });
+                            }
+                        >
+                            {(0..=7).map(|priority| view! { <option value=priority>{priority}</option> }).collect_view()}
+                        </select>
+                    </label>
 
                     <ChannelEditor
                         title="Rotation"
