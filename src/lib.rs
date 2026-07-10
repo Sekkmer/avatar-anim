@@ -5,6 +5,7 @@ use llsd_rs::Llsd;
 use std::collections::HashSet;
 use thiserror::Error;
 
+pub mod bvh;
 pub mod io;
 pub mod skeleton;
 
@@ -29,6 +30,14 @@ pub enum AnimError {
     InvalidStructure(String),
     #[error("LLSD parse error: {0}")]
     Llsd(String),
+    #[error("BVH parse error at line {line}, column {column}: {message}")]
+    BvhParse {
+        line: usize,
+        column: usize,
+        message: String,
+    },
+    #[error("BVH conversion error: {0}")]
+    BvhConversion(String),
 }
 
 #[binrw]
@@ -603,6 +612,36 @@ impl Animation {
             });
         }
         Ok(animation)
+    }
+
+    /// Parse Firestorm LLSD-XML pose data directly from memory.
+    ///
+    /// This is the preferred entry point for browser and WebAssembly clients,
+    /// where an uploaded file is available as bytes rather than a filesystem
+    /// path.
+    pub fn from_llsd_xml(data: &[u8], check_enabled: bool) -> Result<Self> {
+        let llsd = llsd_rs::xml::from_slice(data).map_err(|e| AnimError::Llsd(e.to_string()))?;
+        Self::from_llsd(&llsd, check_enabled)
+    }
+
+    /// Parse a Second Life animation directly from memory.
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        use binrw::BinRead;
+        use std::io::Cursor;
+
+        let mut reader = Cursor::new(data);
+        Self::read_options(&mut reader, Endian::Little, ()).map_err(AnimError::BinRw)
+    }
+
+    /// Serialize a Second Life animation into an in-memory byte buffer.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        use binrw::BinWrite;
+        use std::io::Cursor;
+
+        let mut writer = Cursor::new(Vec::new());
+        self.write_options(&mut writer, Endian::Little, ())
+            .map_err(AnimError::BinRw)?;
+        Ok(writer.into_inner())
     }
 
     /// Load an animation from a .anim file

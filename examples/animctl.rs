@@ -1,6 +1,6 @@
 use avatar_anim::{
     Animation, DuplicateKeyStrategy, JointData, PositionKey, Result, RotationKey, SkeletonBone,
-    SkeletonDefinition,
+    SkeletonDefinition, bvh::BvhImportOptions,
 };
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::{
@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::PathBuf;
 
-/// Inspect and manipulate Second Life `.anim` and Firestorm poser LLSD XML files.
+/// Inspect and manipulate Second Life `.anim`, BVH, and Firestorm poser LLSD XML files.
 ///
 /// Common tasks:
 ///   animctl info walk.anim
@@ -37,7 +37,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Show a summary of an animation file
+    /// Show a summary of an .anim or BVH animation file
     Info {
         #[arg(value_hint=ValueHint::FilePath)]
         file: PathBuf,
@@ -70,9 +70,9 @@ enum Commands {
         #[arg(long)]
         full: bool,
     },
-    /// Convert / transform between poser LLSD XML and .anim, applying filters & edits
+    /// Convert / transform poser XML, BVH, or .anim, applying filters & edits
     Convert {
-        /// Input file (.xml or .anim)
+        /// Input file (.xml, .bvh, or .anim)
         #[arg(short = 'i', long = "input", value_hint=ValueHint::FilePath)]
         input: PathBuf,
         /// Optional output file (.anim). Use '-' to write binary .anim to stdout.
@@ -331,7 +331,7 @@ fn firestorm_pose_dir() -> Option<PathBuf> {
 }
 
 fn cmd_info(path: PathBuf) -> Result<()> {
-    let anim = Animation::from_file(&path)?;
+    let anim = load_animation(&path)?;
     println!("File: {}", path.display());
     println!(
         "Version: {}.{}",
@@ -417,6 +417,22 @@ fn is_xml(path: &std::path::Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("xml"))
 }
 
+fn is_bvh(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("bvh"))
+}
+
+fn load_animation(path: &std::path::Path) -> Result<Animation> {
+    if is_xml(path) {
+        Animation::from_llsd_file(path, true)
+    } else if is_bvh(path) {
+        let skeleton = SkeletonDefinition::embedded_avatar()?;
+        Animation::from_bvh_file(path, &skeleton, &BvhImportOptions::default())
+    } else {
+        Animation::from_file(path)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_convert(
     input: PathBuf,
@@ -433,12 +449,7 @@ fn cmd_convert(
     verbose: bool,
     inserts: Vec<String>,
 ) -> Result<()> {
-    let mut anim = if is_xml(&input) {
-        // Treat as LLSD XML
-        Animation::from_llsd_file(&input, true)?
-    } else {
-        Animation::from_file(&input)?
-    };
+    let mut anim = load_animation(&input)?;
 
     // Process inserts before drops (so dropped joints remove inserted keys if targeted later)
     if !inserts.is_empty() {
@@ -613,7 +624,7 @@ fn ensure_joint<'a>(anim: &'a mut Animation, name: &str) -> &'a mut JointData {
 }
 
 fn cmd_joints(file: PathBuf, joint: Option<String>, summary: bool) -> Result<()> {
-    let anim = Animation::from_file(&file)?;
+    let anim = load_animation(&file)?;
     if let Some(name) = joint {
         if let Some(j) = anim.joints.iter().find(|j| j.name == name) {
             // Compact format: times+values inline
