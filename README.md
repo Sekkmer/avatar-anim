@@ -2,6 +2,8 @@
 
 A Rust library for parsing, inspecting and transforming Second Life avatar animation (`.anim`) files, BVH animations, and Firestorm poser LLSD XML.
 
+**[Open Avatar Anim Studio in your browser](https://sekkmer.github.io/avatar-anim/)** — no installation or file upload required; processing stays in the browser.
+
 ## Features (brief)
 
 - Parse & write `.anim` files (binary) using `binrw`
