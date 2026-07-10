@@ -9,6 +9,10 @@ description = "A parser for Second Life avatar animations files"
 repository = "https://github.com/Sekkmer/avatar-anim"
 keywords = ["secondlife", "parser"]
 
+[workspace]
+members = ["web"]
+resolver = "2"
+
 [dependencies]
 binrw = "0.15.0"
 glam = "0.31.0"
@@ -20,3 +24,9 @@ xml-rs = "1.0"
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
