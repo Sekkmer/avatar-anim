@@ -221,3 +221,49 @@ fn set_duration_updates_loop_bounds() {
     assert_eq!(anim.header.loop_in_point, 0.0);
     assert_eq!(anim.header.loop_out_point, 2.5);
 }
+
+#[test]
+fn animation_memory_roundtrip() {
+    let mut anim = Animation::default();
+    anim.joints.push(JointData {
+        name: "mHead".into(),
+        priority: 4,
+        rotation_keys: vec![RotationKey {
+            time: u16::MAX,
+            rot: Quat::from_rotation_z(0.25),
+        }],
+        position_keys: Vec::new(),
+    });
+
+    let bytes = anim.to_bytes().unwrap();
+    let decoded = Animation::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.joints.len(), 1);
+    assert_eq!(decoded.joints[0].name, "mHead");
+}
+
+#[test]
+fn firestorm_xml_parses_from_memory() {
+    let xml = br#"<llsd><map><key>mHead</key><map>
+        <key>enabled</key><boolean>true</boolean>
+        <key>rotation</key><array><real>0.1</real><real>0.2</real><real>0.3</real></array>
+    </map></map></llsd>"#;
+
+    let anim = Animation::from_llsd_xml(xml, true).unwrap();
+    assert_eq!(anim.joints.len(), 1);
+    assert_eq!(anim.joints[0].rotation_keys.len(), 1);
+}
+
+#[test]
+fn embedded_avatar_skeleton_is_available() {
+    let skeleton = SkeletonDefinition::embedded_avatar().unwrap();
+    assert!(skeleton.bones.len() >= 150);
+    assert!(skeleton.bone("mPelvis").is_some());
+    assert!(skeleton.bone("mHead").is_some());
+    assert!(skeleton.bone("mTail6").is_some());
+    let pelvis_volume = skeleton.bone("PELVIS").unwrap();
+    assert_eq!(pelvis_volume.parent.as_deref(), Some("mPelvis"));
+    assert_eq!(
+        pelvis_volume.attributes.get("group").map(String::as_str),
+        Some("Collision")
+    );
+}

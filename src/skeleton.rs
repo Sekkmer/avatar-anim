@@ -6,6 +6,9 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use xml::reader::{EventReader, XmlEvent};
 
+/// Linden Lab's avatar skeleton bundled with this crate for offline tools.
+pub const AVATAR_SKELETON_XML: &str = include_str!("../assets/avatar_skeleton.xml");
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SkeletonBone {
     pub name: String,
@@ -20,6 +23,16 @@ pub struct SkeletonDefinition {
 }
 
 impl SkeletonDefinition {
+    /// Parse the bundled Linden Lab avatar skeleton.
+    pub fn embedded_avatar() -> Result<Self> {
+        Self::from_xml_str(AVATAR_SKELETON_XML)
+    }
+
+    /// Parse an avatar skeleton from an in-memory XML string.
+    pub fn from_xml_str(xml: &str) -> Result<Self> {
+        Self::from_xml_reader(xml.as_bytes())
+    }
+
     pub fn from_xml_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path).map_err(AnimError::Io)?;
         Self::from_xml_reader(BufReader::new(file))
@@ -37,7 +50,8 @@ impl SkeletonDefinition {
             match event {
                 XmlEvent::StartElement {
                     name, attributes, ..
-                } if name.local_name == "bone" => {
+                } if name.local_name == "bone" || name.local_name == "collision_volume" => {
+                    let is_bone = name.local_name == "bone";
                     let parent = parent_stack.iter().rev().find_map(Clone::clone);
                     let mut attrs = BTreeMap::new();
                     let mut bone_name = None;
@@ -52,7 +66,9 @@ impl SkeletonDefinition {
                         attrs.insert(attr_name, attr.value);
                     }
 
-                    parent_stack.push(bone_name.clone());
+                    if is_bone {
+                        parent_stack.push(bone_name.clone());
+                    }
                     if let Some(name) = bone_name
                         && let Some(pos) = pos
                     {
@@ -80,6 +96,22 @@ impl SkeletonDefinition {
 
     pub fn position(&self, name: &str) -> Option<Vec3> {
         self.bone(name).map(|bone| bone.pos)
+    }
+
+    /// Resolve a canonical joint name or one of its whitespace-separated aliases.
+    pub fn canonical_name(&self, name: &str) -> Option<&str> {
+        self.bones.iter().find_map(|bone| {
+            if bone.name == name
+                || bone
+                    .attributes
+                    .get("aliases")
+                    .is_some_and(|aliases| aliases.split_whitespace().any(|alias| alias == name))
+            {
+                Some(bone.name.as_str())
+            } else {
+                None
+            }
+        })
     }
 
     pub fn bones_with_prefix(&self, prefix: &str) -> Vec<&SkeletonBone> {
